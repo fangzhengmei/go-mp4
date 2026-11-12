@@ -162,9 +162,24 @@ func (bi *BoxInfo) SeekToStart(s io.Seeker) (int64, error) {
 }
 
 func (bi *BoxInfo) SeekToPayload(s io.Seeker) (int64, error) {
-	return s.Seek(int64(bi.Offset+bi.HeaderSize), io.SeekStart)
+	offset, err := checkedBoxOffset(bi.Offset, bi.HeaderSize)
+	if err != nil {
+		return 0, err
+	}
+	return s.Seek(int64(offset), io.SeekStart)
 }
 
 func (bi *BoxInfo) SeekToEnd(s io.Seeker) (int64, error) {
-	return s.Seek(int64(bi.Offset+bi.Size), io.SeekStart)
+	offset, err := checkedBoxOffset(bi.Offset, bi.Size)
+	if err != nil {
+		return 0, err
+	}
+	return s.Seek(int64(offset), io.SeekStart)
+}
+
+func checkedBoxOffset(offset, size uint64) (uint64, error) {
+	if size > math.MaxUint64-offset || offset+size > math.MaxInt64 {
+		return 0, fmt.Errorf("box offset overflow: offset=%d, size=%d", offset, size)
+	}
+	return offset + size, nil
 }

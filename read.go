@@ -8,13 +8,17 @@ import (
 
 func checkPayloadSize(r io.ReadSeeker, bi *BoxInfo) error {
 	fileSize, err := r.Seek(0, io.SeekEnd)
-	if _, seekErr := r.Seek(int64(bi.Offset+bi.HeaderSize), io.SeekStart); seekErr != nil {
+	boxEnd, offsetErr := checkedBoxOffset(bi.Offset, bi.Size)
+	if offsetErr != nil {
+		return offsetErr
+	}
+	if _, seekErr := bi.SeekToPayload(r); seekErr != nil {
 		return seekErr
 	}
 	if err != nil {
 		return nil
 	}
-	if bi.Offset+bi.Size > uint64(fileSize) {
+	if boxEnd > uint64(fileSize) {
 		return fmt.Errorf("box size exceeds file size: offset=%d, size=%d, fileSize=%d", bi.Offset, bi.Size, fileSize)
 	}
 	return nil

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"math"
 
 	"github.com/abema/go-mp4/internal/bitio"
 )
@@ -28,16 +29,18 @@ type Tracks []*Track
 type TrackInfo = Track
 
 type Track struct {
-	TrackID   uint32
-	Timescale uint32
-	Duration  uint64
-	Codec     Codec
-	Encrypted bool
-	EditList  EditList
-	Samples   Samples
-	Chunks    Chunks
-	AVC       *AVCDecConfigInfo
-	MP4A      *MP4AInfo
+	TrackID        uint32
+	Timescale      uint32
+	Duration       uint64
+	Codec          Codec
+	Encrypted      bool
+	EditList       EditList
+	Samples        Samples
+	Chunks         Chunks
+	AVC            *AVCDecConfigInfo
+	MP4A           *MP4AInfo
+	// syncSamplesBox is retained so sync frame lookup can avoid rescanning media data.
+	syncSamplesBox *BoxInfo
 }
 
 type Codec int
@@ -187,7 +190,7 @@ func ProbeFra(r io.ReadSeeker) (*FraProbeInfo, error) {
 func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	track := new(Track)
 
-	bips, err := ExtractBoxesWithPayload(r, bi, []BoxPath{
+	boxPaths := []BoxPath{
 		{BoxTypeTkhd()},
 		{BoxTypeEdts(), BoxTypeElst()},
 		{BoxTypeMdia(), BoxTypeMdhd()},
@@ -205,8 +208,10 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStts()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeCtts()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsc()},
+		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStss()},
 		{BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsz()},
-	})
+	}
+	bis, err := ExtractBoxes(r, bi, boxPaths)
 	if err != nil {
 		return nil, err
 	}
@@ -217,49 +222,102 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	var avcC *AVCDecoderConfiguration
 	var audioSampleEntry *AudioSampleEntry
 	var esds *Esds
-	var stco *Stco
-	var stts *Stts
-	var stsc *Stsc
-	var ctts *Ctts
-	var stsz *Stsz
-	var co64 *Co64
-	for _, bip := range bips {
-		switch bip.Info.Type {
+	var stcoInfo *BoxInfo
+	var co64Info *BoxInfo
+	var sttsInfo *BoxInfo
+	var stscInfo *BoxInfo
+	var cttsInfo *BoxInfo
+	var stszInfo *BoxInfo
+	for _, child := range bis {
+		switch child.Type {
 		case BoxTypeTkhd():
-			tkhd = bip.Payload.(*Tkhd)
+			tkhd = new(Tkhd)
+			if err = unmarshalProbeBox(r, child, tkhd); err != nil {
+				return nil, err
+			}
 		case BoxTypeElst():
-			elst = bip.Payload.(*Elst)
+			elst = new(Elst)
+			if err = unmarshalProbeBox(r, child, elst); err != nil {
+				return nil, err
+			}
 		case BoxTypeMdhd():
-			mdhd = bip.Payload.(*Mdhd)
+			mdhd = new(Mdhd)
+			if err = unmarshalProbeBox(r, child, mdhd); err != nil {
+				return nil, err
+			}
 		case BoxTypeAvc1():
+			avc1 = new(VisualSampleEntry)
+			if err = unmarshalProbeBox(r, child, avc1); err != nil {
+				return nil, err
+			}
 			track.Codec = CodecAVC1
-			avc1 = bip.Payload.(*VisualSampleEntry)
 		case BoxTypeAvcC():
-			avcC = bip.Payload.(*AVCDecoderConfiguration)
+			avcC = new(AVCDecoderConfiguration)
+			if err = unmarshalProbeBox(r, child, avcC); err != nil {
+				return nil, err
+			}
 		case BoxTypeEncv():
+			encv := new(VisualSampleEntry)
+			if err = unmarshalProbeBox(r, child, encv); err != nil {
+				return nil, err
+			}
 			track.Codec = CodecAVC1
 			track.Encrypted = true
+			avc1 = encv
 		case BoxTypeMp4a():
+			audioSampleEntry = new(AudioSampleEntry)
+			if err = unmarshalProbeBox(r, child, audioSampleEntry); err != nil {
+				return nil, err
+			}
 			track.Codec = CodecMP4A
-			audioSampleEntry = bip.Payload.(*AudioSampleEntry)
 		case BoxTypeEnca():
+			enca := new(AudioSampleEntry)
+			if err = unmarshalProbeBox(r, child, enca); err != nil {
+				return nil, err
+			}
 			track.Codec = CodecMP4A
 			track.Encrypted = true
-			audioSampleEntry = bip.Payload.(*AudioSampleEntry)
+			audioSampleEntry = enca
 		case BoxTypeEsds():
-			esds = bip.Payload.(*Esds)
+			esds = new(Esds)
+			if err = unmarshalProbeBox(r, child, esds); err != nil {
+				return nil, err
+			}
 		case BoxTypeStco():
-			stco = bip.Payload.(*Stco)
+			if stcoInfo != nil {
+				return nil, errors.New("duplicate stco box")
+			}
+			stcoInfo = child
 		case BoxTypeStts():
-			stts = bip.Payload.(*Stts)
+			if sttsInfo != nil {
+				return nil, errors.New("duplicate stts box")
+			}
+			sttsInfo = child
 		case BoxTypeStsc():
-			stsc = bip.Payload.(*Stsc)
+			if stscInfo != nil {
+				return nil, errors.New("duplicate stsc box")
+			}
+			stscInfo = child
 		case BoxTypeCtts():
-			ctts = bip.Payload.(*Ctts)
+			if cttsInfo != nil {
+				return nil, errors.New("duplicate ctts box")
+			}
+			cttsInfo = child
 		case BoxTypeStsz():
-			stsz = bip.Payload.(*Stsz)
+			if stszInfo != nil {
+				return nil, errors.New("duplicate stsz box")
+			}
+			stszInfo = child
 		case BoxTypeCo64():
-			co64 = bip.Payload.(*Co64)
+			if co64Info != nil {
+				return nil, errors.New("duplicate co64 box")
+			}
+			co64Info = child
+		case BoxTypeStss():
+			if track.syncSamplesBox != nil {
+				return nil, errors.New("duplicate stss box")
+			}
+			track.syncSamplesBox = child
 		}
 	}
 
@@ -309,72 +367,84 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 		}
 	}
 
-	track.Chunks = make([]*Chunk, 0)
-	if stco != nil {
-		for _, offset := range stco.ChunkOffset {
-			track.Chunks = append(track.Chunks, &Chunk{
-				DataOffset: uint64(offset),
-			})
-		}
-	} else if co64 != nil {
-		for _, offset := range co64.ChunkOffset {
-			track.Chunks = append(track.Chunks, &Chunk{
-				DataOffset: offset,
-			})
-		}
-	} else {
+	if (stcoInfo == nil) == (co64Info == nil) {
 		return nil, errors.New("stco/co64 box not found")
 	}
 
-	if stts == nil {
+	if sttsInfo == nil {
 		return nil, errors.New("stts box not found")
 	}
-	track.Samples = make([]*Sample, 0)
-	for _, entry := range stts.Entries {
-		for i := uint32(0); i < entry.SampleCount; i++ {
-			track.Samples = append(track.Samples, &Sample{
-				TimeDelta: entry.SampleDelta,
-			})
-		}
-	}
 
-	if stsc == nil {
+	if stscInfo == nil {
 		return nil, errors.New("stsc box not found")
 	}
-	for si, entry := range stsc.Entries {
-		end := uint32(len(track.Chunks))
-		if si != len(stsc.Entries)-1 && stsc.Entries[si+1].FirstChunk-1 < end {
-			end = stsc.Entries[si+1].FirstChunk - 1
-		}
-		for ci := entry.FirstChunk - 1; ci < end; ci++ {
-			track.Chunks[ci].SamplesPerChunk = entry.SamplesPerChunk
+
+	fileSize, err := readSeekerSize(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if stcoInfo != nil {
+		track.Chunks, err = readStcoChunks(r, stcoInfo, fileSize)
+	} else {
+		track.Chunks, err = readCo64Chunks(r, co64Info, fileSize)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	sampleCount, sttsEntries, err := readSttsSummary(r, sttsInfo)
+	if err != nil {
+		return nil, err
+	}
+
+	chunkSampleCount, err := readStscChunks(r, stscInfo, track.Chunks)
+	if err != nil {
+		return nil, err
+	}
+	if chunkSampleCount != uint64(sampleCount) {
+		return nil, errors.New("stsc sample count does not match stts sample count")
+	}
+	sampleCountInt, err := probeEntryCountInt(sampleCount)
+	if err != nil {
+		return nil, err
+	}
+
+	track.Samples = make(Samples, sampleCountInt)
+	sampleValues := make([]Sample, sampleCountInt)
+	for i := range track.Samples {
+		track.Samples[i] = &sampleValues[i]
+	}
+
+	var sampleIndex uint32
+	for _, entry := range sttsEntries {
+		for i := uint32(0); i < entry.count; i++ {
+			track.Samples[sampleIndex].TimeDelta = entry.delta
+			sampleIndex++
 		}
 	}
 
-	if ctts != nil {
-		var si uint32
-		for ci, entry := range ctts.Entries {
-			for i := uint32(0); i < entry.SampleCount; i++ {
-				if si >= uint32(len(track.Samples)) {
-					break
-				}
-				track.Samples[si].CompositionTimeOffset = ctts.GetSampleOffset(ci)
-				si++
-			}
+	if cttsInfo != nil {
+		count, err := readCttsSamples(r, cttsInfo, track.Samples)
+		if err != nil {
+			return nil, err
+		}
+		if count != sampleCount {
+			return nil, errors.New("ctts sample count does not match stts sample count")
 		}
 	}
 
-	if stsz != nil {
-		if stsz.SampleSize != 0 {
-			// all samples have the same size and the table is empty
-			for i := range track.Samples {
-				track.Samples[i].Size = stsz.SampleSize
-			}
-		} else {
-			for i := 0; i < len(stsz.EntrySize) && i < len(track.Samples); i++ {
-				track.Samples[i].Size = stsz.EntrySize[i]
-			}
+	if stszInfo != nil {
+		count, err := readStszSamples(r, stszInfo, track.Samples)
+		if err != nil {
+			return nil, err
 		}
+		if count != sampleCount {
+			return nil, errors.New("stsz sample count does not match stts sample count")
+		}
+	}
+	if err := validateChunkSampleRanges(track.Chunks, track.Samples, fileSize); err != nil {
+		return nil, err
 	}
 
 	return track, nil
@@ -600,39 +670,68 @@ func FindIDRFrames(r io.ReadSeeker, trackInfo *TrackInfo) ([]int, error) {
 	if trackInfo.AVC == nil {
 		return nil, nil
 	}
+	if trackInfo.syncSamplesBox != nil {
+		return readStssSampleNumbers(r, trackInfo.syncSamplesBox, uint32(len(trackInfo.Samples)))
+	}
 	lengthSize := uint32(trackInfo.AVC.LengthSize)
 
 	var si int
 	idxs := make([]int, 0, 8)
+	nalHeaderBuffer := make([]byte, lengthSize+1)
 	for _, chunk := range trackInfo.Chunks {
-		end := si + int(chunk.SamplesPerChunk)
+		end, overflow := addUint64(uint64(si), uint64(chunk.SamplesPerChunk))
+		if overflow || end > math.MaxInt64 {
+			return nil, errors.New("sample index overflow")
+		}
 		dataOffset := chunk.DataOffset
-		for ; si < end && si < len(trackInfo.Samples); si++ {
+		for ; uint64(si) < end && si < len(trackInfo.Samples); si++ {
 			sample := trackInfo.Samples[si]
 			if sample.Size == 0 {
 				continue
 			}
-			for nalOffset := uint32(0); nalOffset+lengthSize+1 <= sample.Size; {
-				if _, err := r.Seek(int64(dataOffset+uint64(nalOffset)), io.SeekStart); err != nil {
+			nalOffset := uint64(0)
+			for {
+				nextHeaderOffset, overflow := addUint64(nalOffset, uint64(lengthSize)+1)
+				if overflow || nextHeaderOffset > uint64(sample.Size) {
+					break
+				}
+				seekOffset, overflow := addUint64(dataOffset, nalOffset)
+				if overflow || seekOffset > math.MaxInt64 {
+					return nil, errors.New("NAL unit offset overflow")
+				}
+				if _, err := r.Seek(int64(seekOffset), io.SeekStart); err != nil {
 					return nil, err
 				}
-				data := make([]byte, lengthSize+1)
-				if _, err := io.ReadFull(r, data); err != nil {
+				if _, err := io.ReadFull(r, nalHeaderBuffer); err != nil {
 					return nil, err
 				}
 				var length uint32
 				for i := 0; i < int(lengthSize); i++ {
-					length = (length << 8) + uint32(data[i])
+					length = (length << 8) + uint32(nalHeaderBuffer[i])
 				}
-				nalHeader := data[lengthSize]
+				if length == 0 {
+					return nil, errors.New("invalid NAL unit length")
+				}
+				nalHeader := nalHeaderBuffer[lengthSize]
 				nalType := nalHeader & 0x1f
 				if nalType == 5 {
 					idxs = append(idxs, si)
 					break
 				}
-				nalOffset += lengthSize + length
+				nextOffset, overflow := addUint64(nalOffset, uint64(lengthSize))
+				if overflow {
+					return nil, errors.New("NAL unit offset overflow")
+				}
+				nalOffset, overflow = addUint64(nextOffset, uint64(length))
+				if overflow {
+					return nil, errors.New("NAL unit offset overflow")
+				}
 			}
-			dataOffset += uint64(sample.Size)
+			nextDataOffset, err := checkedSampleEnd(dataOffset, sample.Size)
+			if err != nil {
+				return nil, err
+			}
+			dataOffset = nextDataOffset
 		}
 	}
 	return idxs, nil
