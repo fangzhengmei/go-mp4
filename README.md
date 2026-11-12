@@ -51,6 +51,32 @@ _, err := mp4.ReadBoxStructure(file, func(h *mp4.ReadHandle) (interface{}, error
 
 [ExtractBox](https://pkg.go.dev/github.com/abema/go-mp4#ExtractBox), [ExtractBoxes](https://pkg.go.dev/github.com/abema/go-mp4#ExtractBoxes), [ExtractBoxWithPayload](https://pkg.go.dev/github.com/abema/go-mp4#ExtractBoxWithPayload), [ExtractBoxesWithPayload](https://pkg.go.dev/github.com/abema/go-mp4#ExtractBoxesWithPayload), and [Probe](https://pkg.go.dev/github.com/abema/go-mp4#Probe) are wrapper functions of ReadBoxStructure.
 
+### Read budget
+
+[ReadBoxStructureWithBudget](https://pkg.go.dev/github.com/abema/go-mp4#ReadBoxStructureWithBudget) lets callers cap the work spent on untrusted input independently for the cumulative number of bytes read, the maximum nesting depth and the maximum number of boxes. A zero value disables the corresponding limit, and passing a nil budget behaves exactly like ReadBoxStructure.
+
+When a limit is crossed, parsing stops before invoking the handler for the offending box (and all later boxes) and a distinguishable sentinel error is returned: [ErrReadBudgetBytesExceeded](https://pkg.go.dev/github.com/abema/go-mp4#ErrReadBudgetBytesExceeded), [ErrReadBudgetDepthExceeded](https://pkg.go.dev/github.com/abema/go-mp4#ErrReadBudgetDepthExceeded) or [ErrReadBudgetBoxesExceeded](https://pkg.go.dev/github.com/abema/go-mp4#ErrReadBudgetBoxesExceeded). Use `errors.Is` to tell them apart. Every `BoxInfo` delivered before the failure still reports its real media offset, including boxes using a 64-bit extended size, a zero size (extends to EOF) or an unknown type.
+
+```go
+budget := &mp4.ReadBudget{
+	MaxReadBytes: 1 << 20, // at most 1 MiB read from the source
+	MaxDepth:     32,      // at most 32 levels of nesting
+	MaxBoxes:     10000,   // at most 10000 boxes
+}
+_, err := mp4.ReadBoxStructureWithBudget(file, budget, func(h *mp4.ReadHandle) (interface{}, error) {
+	// ... the same handler as ReadBoxStructure
+	return nil, nil
+})
+switch {
+case errors.Is(err, mp4.ErrReadBudgetBytesExceeded):
+	// too many bytes read
+case errors.Is(err, mp4.ErrReadBudgetDepthExceeded):
+	// nesting too deep
+case errors.Is(err, mp4.ErrReadBudgetBoxesExceeded):
+	// too many boxes
+}
+```
+
 ```go
 // extract specific boxes
 boxes, err := mp4.ExtractBoxWithPayload(file, nil, mp4.BoxPath{mp4.BoxTypeMoov(), mp4.BoxTypeTrak(), mp4.BoxTypeTkhd()})

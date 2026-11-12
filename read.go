@@ -52,14 +52,25 @@ func ReadBoxStructure(r io.ReadSeeker, handler ReadHandler, params ...interface{
 	if _, err := r.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	return readBoxStructure(r, 0, true, nil, Context{}, handler, params)
+	return readBoxStructure(r, 0, true, nil, Context{}, nil, handler, params)
 }
 
 func ReadBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, handler ReadHandler, params ...interface{}) (interface{}, error) {
-	return readBoxStructureFromInternal(r, bi, nil, handler, params)
+	return readBoxStructureFromInternal(r, bi, nil, nil, handler, params)
 }
 
-func readBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, path BoxPath, handler ReadHandler, params []interface{}) (interface{}, error) {
+func readBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, path BoxPath, budget *readBudgetState, handler ReadHandler, params []interface{}) (interface{}, error) {
+	// Enforce the structural budgets at the box boundary, before any callback
+	// or payload parse, so an exhausted budget stops all later callbacks while
+	// the already-parsed BoxInfo keeps its real media offset.
+	depth := uint64(len(path) + 1)
+	if err := budget.checkDepth(depth); err != nil {
+		return nil, err
+	}
+	if err := budget.checkBoxCount(); err != nil {
+		return nil, err
+	}
+
 	if _, err := bi.SeekToPayload(r); err != nil {
 		return nil, err
 	}
@@ -171,7 +182,7 @@ func readBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, path BoxPath, ha
 		}
 
 		childrenSize := bi.Offset + bi.Size - childrenOffset
-		return readBoxStructure(r, childrenSize, false, newPath, ctx, handler, params)
+		return readBoxStructure(r, childrenSize, false, newPath, ctx, budget, handler, params)
 	}
 
 	if val, err := handler(h); err != nil {
@@ -183,7 +194,7 @@ func readBoxStructureFromInternal(r io.ReadSeeker, bi *BoxInfo, path BoxPath, ha
 	}
 }
 
-func readBoxStructure(r io.ReadSeeker, totalSize uint64, isRoot bool, path BoxPath, ctx Context, handler ReadHandler, params []interface{}) ([]interface{}, error) {
+func readBoxStructure(r io.ReadSeeker, totalSize uint64, isRoot bool, path BoxPath, ctx Context, budget *readBudgetState, handler ReadHandler, params []interface{}) ([]interface{}, error) {
 	vals := make([]interface{}, 0, 8)
 
 	for isRoot || totalSize >= SmallHeaderSize {
@@ -201,7 +212,7 @@ func readBoxStructure(r io.ReadSeeker, totalSize uint64, isRoot bool, path BoxPa
 
 		bi.Context = ctx
 
-		val, err := readBoxStructureFromInternal(r, bi, path, handler, params)
+		val, err := readBoxStructureFromInternal(r, bi, path, budget, handler, params)
 		if err != nil {
 			return nil, err
 		}
