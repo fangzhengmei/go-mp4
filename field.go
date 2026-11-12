@@ -33,6 +33,10 @@ const (
 	fieldBoxString                           // 11 - non-null-terminated string (14496-30)
 )
 
+// field is built once from Go struct tags and remains shared by all codec
+// operations. It describes only static reflection metadata. Per-box values
+// such as dynamic sizes, dynamic lengths and optional-field decisions are kept
+// out of this cached structure.
 type field struct {
 	children []*field
 	name     string
@@ -248,58 +252,4 @@ func parseFieldTag(str string) map[string]string {
 	}
 
 	return tag
-}
-
-type fieldInstance struct {
-	field
-	cfo ICustomFieldObject
-}
-
-func resolveFieldInstance(f *field, box IImmutableBox, parent reflect.Value, ctx Context) *fieldInstance {
-	fi := fieldInstance{
-		field: *f,
-	}
-
-	cfo, ok := parent.Addr().Interface().(ICustomFieldObject)
-	if ok {
-		fi.cfo = cfo
-	} else {
-		fi.cfo = box
-	}
-
-	if fi.is(fieldSizeDynamic) {
-		fi.size = fi.cfo.GetFieldSize(f.name, ctx)
-	}
-
-	if fi.is(fieldLengthDynamic) {
-		fi.length = fi.cfo.GetFieldLength(f.name, ctx)
-	}
-
-	return &fi
-}
-
-func isTargetField(box IImmutableBox, fi *fieldInstance, ctx Context) bool {
-	if box.GetVersion() != anyVersion {
-		if fi.version != anyVersion && box.GetVersion() != fi.version {
-			return false
-		}
-
-		if fi.nVersion != anyVersion && box.GetVersion() == fi.nVersion {
-			return false
-		}
-	}
-
-	if fi.optFlag != 0 && box.GetFlags()&fi.optFlag == 0 {
-		return false
-	}
-
-	if fi.nOptFlag != 0 && box.GetFlags()&fi.nOptFlag != 0 {
-		return false
-	}
-
-	if fi.is(fieldOptDynamic) && !fi.cfo.IsOptFieldEnabled(fi.name, ctx) {
-		return false
-	}
-
-	return true
 }

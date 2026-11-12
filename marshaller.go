@@ -402,11 +402,20 @@ func (u *unmarshaller) unmarshalStruct(v reflect.Value, fs []*field) error {
 			return err
 		}
 
-		if v.FieldByName(f.name).Type() == reflect.TypeOf(FullBox{}) && !u.dst.GetType().IsSupportedVersion(u.dst.GetVersion(), u.ctx) {
-			return ErrUnsupportedBoxVersion
+		if v.FieldByName(f.name).Type() == reflect.TypeOf(FullBox{}) {
+			if err := checkSupportedBoxVersion(u.dst, u.ctx); err != nil {
+				return err
+			}
 		}
 	}
 
+	return nil
+}
+
+func checkSupportedBoxVersion(box IBox, ctx Context) error {
+	if !box.GetType().IsSupportedVersion(box.GetVersion(), ctx) {
+		return ErrUnsupportedBoxVersion
+	}
 	return nil
 }
 
