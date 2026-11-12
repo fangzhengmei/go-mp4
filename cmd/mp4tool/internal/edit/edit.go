@@ -84,14 +84,18 @@ func editFile(inputPath, outputPath string) error {
 			return uint64(0), nil
 		}
 
+		// Unknown boxes and the media data box are opaque: their raw bytes,
+		// including the original header (small or 64-bit large-size) and the
+		// relative ordering against their siblings, are copied untouched.
+		// Their contents are never interpreted as nested boxes.
 		if !h.BoxInfo.IsSupportedType() || h.BoxInfo.Type == mp4.BoxTypeMdat() {
-			// copy all data
 			return nil, w.CopyBox(r, &h.BoxInfo)
 		}
 
-		// write header
-		_, err := w.StartBox(&h.BoxInfo)
-		if err != nil {
+		// Known boxes are parsed and re-serialized so that edited fields are
+		// applied. The writer recalculates every box size and upgrades the
+		// header to the 64-bit large-size form when necessary.
+		if _, err := w.StartBox(&h.BoxInfo); err != nil {
 			return nil, err
 		}
 		// read payload
@@ -99,6 +103,7 @@ func editFile(inputPath, outputPath string) error {
 		if err != nil {
 			return nil, err
 		}
+
 		// edit some fields
 		switch h.BoxInfo.Type {
 		case mp4.BoxTypeTfdt():
@@ -111,10 +116,12 @@ func editFile(inputPath, outputPath string) error {
 				}
 			}
 		}
+
 		// write payload
 		if _, err := mp4.Marshal(w, box, h.BoxInfo.Context); err != nil {
 			return nil, err
 		}
+
 		// expand all of offsprings
 		if _, err := h.Expand(); err != nil {
 			return nil, err

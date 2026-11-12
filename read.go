@@ -7,12 +7,24 @@ import (
 )
 
 func checkPayloadSize(r io.ReadSeeker, bi *BoxInfo) error {
-	fileSize, err := r.Seek(0, io.SeekEnd)
-	if _, seekErr := r.Seek(int64(bi.Offset+bi.HeaderSize), io.SeekStart); seekErr != nil {
-		return seekErr
-	}
-	if err != nil {
+	// A box whose size field is zero extends to the end of the file by
+	// definition, so its declared size can never exceed the file size.
+	if bi.ExtendToEOF {
 		return nil
+	}
+
+	// Some io.ReadSeeker implementations (buffered readers, in-memory
+	// files and pipes) return an error for SeekEnd even though regular
+	// positioning works. The size check is only a validation, therefore a
+	// failed SeekEnd must not break reading; the actual payload reads still
+	// fail on genuinely truncated input.
+	fileSize, err := r.Seek(0, io.SeekEnd)
+	if err != nil {
+		_, _ = r.Seek(int64(bi.Offset+bi.HeaderSize), io.SeekStart)
+		return nil
+	}
+	if _, err := r.Seek(int64(bi.Offset+bi.HeaderSize), io.SeekStart); err != nil {
+		return err
 	}
 	if bi.Offset+bi.Size > uint64(fileSize) {
 		return fmt.Errorf("box size exceeds file size: offset=%d, size=%d, fileSize=%d", bi.Offset, bi.Size, fileSize)
@@ -187,6 +199,12 @@ func readBoxStructure(r io.ReadSeeker, totalSize uint64, isRoot bool, path BoxPa
 	vals := make([]interface{}, 0, 8)
 
 	for isRoot || totalSize >= SmallHeaderSize {
+		if !isRoot && totalSize < SmallHeaderSize {
+			// Trailing bytes inside a container that are too short to form
+			// another box header indicate a truncated input.
+			return nil, io.ErrUnexpectedEOF
+		}
+
 		bi, err := ReadBoxInfo(r)
 		if isRoot && err == io.EOF {
 			return vals, nil
@@ -196,6 +214,12 @@ func readBoxStructure(r io.ReadSeeker, totalSize uint64, isRoot bool, path BoxPa
 
 		if !isRoot && bi.Size > totalSize {
 			return nil, fmt.Errorf("too large box size: type=%s, size=%d, actualBufSize=%d", bi.Type.String(), bi.Size, totalSize)
+		}
+		if !isRoot && bi.ExtendToEOF {
+			// A zero size field is only valid for a top-level box, where it
+			// means the box extends to the end of the file. Inside a
+			// container it is an invalid input that could loop forever.
+			return nil, fmt.Errorf("invalid zero-size box in container: type=%s", bi.Type.String())
 		}
 		totalSize -= bi.Size
 

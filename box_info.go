@@ -140,6 +140,11 @@ func ReadBoxInfo(r io.ReadSeeker) (*BoxInfo, error) {
 		if _, err := bi.SeekToPayload(r); err != nil {
 			return nil, err
 		}
+		// A zero-size box that contains no bytes at all is invalid: it cannot
+		// represent a box and would never make progress when iterated.
+		if bi.Size < SmallHeaderSize {
+			return nil, fmt.Errorf("invalid zero-size box: type=%s", bi.Type.String())
+		}
 	} else if bi.Size == 1 {
 		// read more 8 bytes
 		buf.Reset()
