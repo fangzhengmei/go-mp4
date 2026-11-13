@@ -15,7 +15,10 @@ const (
 	anyVersion = math.MaxUint8
 )
 
-var ErrUnsupportedBoxVersion = errors.New("unsupported box version")
+var (
+	ErrUnsupportedBoxVersion = errors.New("unsupported box version")
+	ErrVarintOverflow        = errors.New("varint overflow")
+)
 
 func readerHasSize(reader bitio.ReadSeeker, size uint64) bool {
 	pre, err := reader.Seek(0, io.SeekCurrent)
@@ -252,11 +255,28 @@ func (m *marshaller) marshalString(v reflect.Value, fi *fieldInstance) error {
 }
 
 func (m *marshaller) writeUvarint(u uint64) error {
-	for i := 21; i > 0; i -= 7 {
-		if err := m.writer.WriteBits([]byte{(byte(u >> uint(i))) | 0x80}, 8); err != nil {
-			return err
+	// Values that fit in 28 bits retain the four-byte encoding used by MP4
+	// descriptor sizes. Larger values use the normal unsigned LEB128 form,
+	// which prevents high bits from being silently truncated.
+	if u < 1<<28 {
+		for i := 21; i > 0; i -= 7 {
+			b := byte(u >> uint(i))
+			if i > 0 {
+				b |= 0x80
+			}
+			if err := m.writer.WriteBits([]byte{b}, 8); err != nil {
+				return err
+			}
+			m.wbits += 8
 		}
-		m.wbits += 8
+	} else {
+		for u >= 0x80 {
+			if err := m.writer.WriteBits([]byte{byte(u&0x7f) | 0x80}, 8); err != nil {
+				return err
+			}
+			u >>= 7
+			m.wbits += 8
+		}
 	}
 
 	if err := m.writer.WriteBits([]byte{byte(u) & 0x7f}, 8); err != nil {
@@ -644,16 +664,60 @@ func (u *unmarshaller) tryReadPString(v reflect.Value, fi *fieldInstance) (ok bo
 }
 
 func (u *unmarshaller) readUvarint() (uint64, error) {
-	var val uint64
-	for {
+	first, err := u.reader.ReadBits(8)
+	if err != nil {
+		return 0, err
+	}
+	u.rbits += 8
+	if first[0]&0x80 == 0 {
+		return uint64(first[0] & 0x7f), nil
+	}
+
+	second, err := u.reader.ReadBits(8)
+	if err != nil {
+		return 0, err
+	}
+	u.rbits += 8
+	if second[0]&0x80 == 0 {
+		return uint64(first[0]&0x7f)<<7 | uint64(second[0]&0x7f), nil
+	}
+
+	third, err := u.reader.ReadBits(8)
+	if err != nil {
+		return 0, err
+	}
+	u.rbits += 8
+	if third[0]&0x80 == 0 {
+		return uint64(first[0]&0x7f)<<14 | uint64(second[0]&0x7f)<<7 | uint64(third[0]&0x7f), nil
+	}
+
+	fourth, err := u.reader.ReadBits(8)
+	if err != nil {
+		return 0, err
+	}
+	u.rbits += 8
+
+	// Four continuation-bearing bytes form the big-endian MP4 prefix.
+	// A terminal fourth byte still represents the lowest seven bits.
+	val := uint64(first[0]&0x7f)<<21 |
+		uint64(second[0]&0x7f)<<14 |
+		uint64(third[0]&0x7f)<<7 |
+		uint64(fourth[0]&0x7f)
+	if fourth[0]&0x80 == 0 {
+		return val, nil
+	}
+
+	// Values larger than 28 bits append ordinary little-endian LEB128 groups.
+	for shift := uint(28); ; shift += 7 {
+		if shift >= 64 {
+			return 0, ErrVarintOverflow
+		}
 		octet, err := u.reader.ReadBits(8)
 		if err != nil {
 			return 0, err
 		}
 		u.rbits += 8
-
-		val = (val << 7) + uint64(octet[0]&0x7f)
-
+		val |= uint64(octet[0]&0x7f) << shift
 		if octet[0]&0x80 == 0 {
 			return val, nil
 		}

@@ -3,6 +3,7 @@ package mp4
 import (
 	"bytes"
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/abema/go-mp4/internal/bitio"
@@ -377,6 +378,8 @@ func TestReadVarint(t *testing.T) {
 		{name: "overrun", input: []byte{0xac, 0xd2, 0xef}, err: true},
 		{name: "1 byte padded", input: []byte{0x80, 0x80, 0x80, 0x6c}, expected: 0x6c},
 		{name: "2 byte padded", input: []byte{0x80, 0x80, 0x81, 0x0c}, expected: 0x8c},
+		{name: "uint32 max extended", input: []byte{0xff, 0xff, 0xff, 0xff, 0x0f}, expected: 0xffffffff},
+		{name: "uint64 max extended", input: []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}, expected: math.MaxUint64},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -409,6 +412,8 @@ func TestWriteVarint(t *testing.T) {
 		{name: "1 byte into 2 bytes", input: 0x8c, expected: []byte{0x80, 0x80, 0x81, 0x0c}},
 		{name: "2 bytes", input: 0x1652, expected: []byte{0x80, 0x80, 0xac, 0x52}},
 		{name: "3 bytes", input: 0xb2943, expected: []byte{0x80, 0xac, 0xd2, 0x43}},
+		{name: "uint32 max", input: 0xffffffff, expected: []byte{0xff, 0xff, 0xff, 0xff, 0x0f}},
+		{name: "uint64 max", input: math.MaxUint64, expected: []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}},
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
