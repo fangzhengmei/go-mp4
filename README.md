@@ -116,6 +116,21 @@ The following sample code adds a metadata box and updates the chunk offsets in t
 
 [Sample Code: Insert Metadata and Update stco box](https://gist.github.com/sunfish-shogi/cccde016a38c66d32c07a0234368804e)
 
+#### Moving the moov box
+
+RewriteMetadata moves the moov box to either the beginning or end of the
+container. It preserves every other top-level box byte-for-byte, keeps unknown
+boxes and their relative order, recalculates stco/co64 chunk offsets, and
+converts stco to co64 when a new offset does not fit in uint32.
+
+```go
+err := mp4.RewriteMetadataFile(inputPath, outputPath, mp4.MetadataAtBeginning)
+```
+
+The file-based API writes a temporary file in the destination directory and
+renames it only after the full output has been synced, so a failure does not
+replace an existing output file.
+
 ### User-defined Boxes
 
 You can define additional box types as follows:
