@@ -3,6 +3,7 @@ package mp4
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/abema/go-mp4/internal/bitio"
@@ -127,11 +128,14 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 			if _, err := bi.SeekToPayload(r); err != nil {
 				return nil, err
 			}
-			if err := checkPayloadSize(r, bi); err != nil {
+			if err := checkPayloadSize(r, bi, BoxPath{BoxTypeFtyp()}); err != nil {
 				return nil, err
 			}
 			if _, err := Unmarshal(r, bi.Size-bi.HeaderSize, &ftyp, bi.Context); err != nil {
-				return nil, err
+				if _, seekErr := bi.SeekToPayload(r); seekErr != nil {
+					return nil, seekErr
+				}
+				return nil, wrapReadError(err, BoxPath{BoxTypeFtyp()}, bi, r)
 			}
 			probeInfo.MajorBrand = ftyp.MajorBrand
 			probeInfo.MinorVersion = ftyp.MinorVersion
@@ -146,11 +150,15 @@ func Probe(r io.ReadSeeker) (*ProbeInfo, error) {
 			if _, err := bi.SeekToPayload(r); err != nil {
 				return nil, err
 			}
-			if err := checkPayloadSize(r, bi); err != nil {
+			path := BoxPath{BoxTypeMoov(), BoxTypeMvhd()}
+			if err := checkPayloadSize(r, bi, path); err != nil {
 				return nil, err
 			}
 			if _, err := Unmarshal(r, bi.Size-bi.HeaderSize, &mvhd, bi.Context); err != nil {
-				return nil, err
+				if _, seekErr := bi.SeekToPayload(r); seekErr != nil {
+					return nil, seekErr
+				}
+				return nil, wrapReadError(err, path, bi, r)
 			}
 			probeInfo.Timescale = mvhd.Timescale
 			if mvhd.GetVersion() == 0 {
@@ -186,6 +194,7 @@ func ProbeFra(r io.ReadSeeker) (*FraProbeInfo, error) {
 
 func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	track := new(Track)
+	trackPath := BoxPath{BoxTypeMoov(), BoxTypeTrak()}
 
 	bips, err := ExtractBoxesWithPayload(r, bi, []BoxPath{
 		{BoxTypeTkhd()},
@@ -264,7 +273,7 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	}
 
 	if tkhd == nil {
-		return nil, errors.New("tkhd box not found")
+		return nil, wrapBoxError(errors.New("tkhd box not found"), append(copyBoxPath(trackPath), BoxTypeTkhd()), bi, bi.Offset)
 	}
 	track.TrackID = tkhd.TrackID
 
@@ -280,7 +289,7 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	}
 
 	if mdhd == nil {
-		return nil, errors.New("mdhd box not found")
+		return nil, wrapBoxError(errors.New("mdhd box not found"), append(copyBoxPath(trackPath), BoxTypeMdia(), BoxTypeMdhd()), bi, bi.Offset)
 	}
 	track.Timescale = mdhd.Timescale
 	track.Duration = mdhd.GetDuration()
@@ -300,7 +309,8 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	if audioSampleEntry != nil && esds != nil {
 		oti, audOTI, err := detectAACProfile(esds)
 		if err != nil {
-			return nil, err
+			path := BoxPath{BoxTypeMoov(), BoxTypeTrak(), BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsd(), BoxTypeMp4a(), BoxTypeEsds()}
+			return nil, wrapBoxError(err, path, bi, bi.Offset)
 		}
 		track.MP4A = &MP4AInfo{
 			OTI:          oti,
@@ -323,11 +333,11 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 			})
 		}
 	} else {
-		return nil, errors.New("stco/co64 box not found")
+		return nil, wrapBoxError(errors.New("stco/co64 box not found"), append(copyBoxPath(trackPath), BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl()), bi, bi.Offset)
 	}
 
 	if stts == nil {
-		return nil, errors.New("stts box not found")
+		return nil, wrapBoxError(errors.New("stts box not found"), append(copyBoxPath(trackPath), BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStts()), bi, bi.Offset)
 	}
 	track.Samples = make([]*Sample, 0)
 	for _, entry := range stts.Entries {
@@ -339,7 +349,7 @@ func probeTrak(r io.ReadSeeker, bi *BoxInfo) (*Track, error) {
 	}
 
 	if stsc == nil {
-		return nil, errors.New("stsc box not found")
+		return nil, wrapBoxError(errors.New("stsc box not found"), append(copyBoxPath(trackPath), BoxTypeMdia(), BoxTypeMinf(), BoxTypeStbl(), BoxTypeStsc()), bi, bi.Offset)
 	}
 	for si, entry := range stsc.Entries {
 		end := uint32(len(track.Chunks))
@@ -545,7 +555,8 @@ func probeTraf(r io.ReadSeeker, bi *BoxInfo) (*Segment, error) {
 	}
 
 	if tfhd == nil {
-		return nil, errors.New("tfhd not found")
+		path := BoxPath{BoxTypeMoof(), BoxTypeTraf(), BoxTypeTfhd()}
+		return nil, wrapBoxError(errors.New("tfhd not found"), path, bi, bi.Offset)
 	}
 	segment.TrackID = tfhd.TrackID
 	segment.DefaultSampleDuration = tfhd.DefaultSampleDuration
@@ -601,6 +612,22 @@ func FindIDRFrames(r io.ReadSeeker, trackInfo *TrackInfo) ([]int, error) {
 		return nil, nil
 	}
 	lengthSize := uint32(trackInfo.AVC.LengthSize)
+	var mdat *BoxInfo
+	if _, err := r.Seek(0, io.SeekStart); err != nil {
+		return nil, &ReaderError{Offset: 0, Err: err}
+	}
+	if _, err := ReadBoxStructure(r, func(h *ReadHandle) (interface{}, error) {
+		if h.BoxInfo.Type == BoxTypeMdat() {
+			info := h.BoxInfo
+			mdat = &info
+		}
+		if h.BoxInfo.Type == BoxTypeMoov() {
+			return h.Expand()
+		}
+		return nil, nil
+	}); err != nil {
+		return nil, err
+	}
 
 	var si int
 	idxs := make([]int, 0, 8)
@@ -613,12 +640,25 @@ func FindIDRFrames(r io.ReadSeeker, trackInfo *TrackInfo) ([]int, error) {
 				continue
 			}
 			for nalOffset := uint32(0); nalOffset+lengthSize+1 <= sample.Size; {
-				if _, err := r.Seek(int64(dataOffset+uint64(nalOffset)), io.SeekStart); err != nil {
-					return nil, err
+				failureOffset := dataOffset + uint64(nalOffset)
+				if _, err := r.Seek(int64(failureOffset), io.SeekStart); err != nil {
+					return nil, &ReaderError{Offset: failureOffset, Err: err}
 				}
 				data := make([]byte, lengthSize+1)
 				if _, err := io.ReadFull(r, data); err != nil {
-					return nil, err
+					current, seekErr := currentOffset(r)
+					if seekErr != nil {
+						return nil, seekErr
+					}
+					wrapped := fmt.Errorf("sample read failed: sample=%d chunk_offset=%d sample_offset=%d failure_offset=%d: %w",
+						si, chunk.DataOffset, dataOffset, current, err)
+					if isTruncationError(err) && mdat != nil {
+						return nil, wrapBoxError(wrapped, BoxPath{BoxTypeMdat()}, mdat, current)
+					}
+					if isTruncationError(err) {
+						return nil, &BoxError{Offset: current, Err: wrapped}
+					}
+					return nil, &ReaderError{Offset: current, Err: wrapped}
 				}
 				var length uint32
 				for i := 0; i < int(lengthSize); i++ {

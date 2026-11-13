@@ -1,6 +1,7 @@
 package extract
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -56,8 +57,13 @@ func Main(args []string) int {
 func extract(r io.ReadSeeker, boxType mp4.BoxType) error {
 	_, err := mp4.ReadBoxStructure(r, func(h *mp4.ReadHandle) (interface{}, error) {
 		if h.BoxInfo.Type == boxType {
-			h.BoxInfo.SeekToStart(r)
-			if _, err := io.CopyN(os.Stdout, r, int64(h.BoxInfo.Size)); err != nil {
+			if _, err := h.BoxInfo.SeekToStart(r); err != nil {
+				return nil, err
+			}
+			if _, err := os.Stdout.Write(mp4.EncodeBoxInfo(&h.BoxInfo)); err != nil {
+				return nil, err
+			}
+			if _, err := h.ReadData(os.Stdout); err != nil {
 				return nil, err
 			}
 		}
@@ -68,7 +74,7 @@ func extract(r io.ReadSeeker, boxType mp4.BoxType) error {
 			return nil, nil
 		}
 		_, err := h.Expand()
-		if err == mp4.ErrUnsupportedBoxVersion {
+		if errors.Is(err, mp4.ErrUnsupportedBoxVersion) {
 			return nil, nil
 		}
 		return nil, err

@@ -2,6 +2,7 @@ package dump
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -132,7 +133,7 @@ func (m *mp4dump) dump(r io.ReadSeeker) error {
 			}
 
 			box, _, err := h.ReadPayload()
-			if err != mp4.ErrUnsupportedBoxVersion {
+			if !errors.Is(err, mp4.ErrUnsupportedBoxVersion) {
 				if err != nil {
 					return nil, err
 				}

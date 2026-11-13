@@ -15,34 +15,52 @@ func ExtractBoxWithPayload(r io.ReadSeeker, parent *BoxInfo, path BoxPath) ([]*B
 }
 
 func ExtractBoxesWithPayload(r io.ReadSeeker, parent *BoxInfo, paths []BoxPath) ([]*BoxInfoWithPayload, error) {
-	bis, err := ExtractBoxes(r, parent, paths)
-	if err != nil {
-		return nil, err
+	if len(paths) == 0 {
+		return nil, nil
 	}
 
-	bs := make([]*BoxInfoWithPayload, 0, len(bis))
-	for _, bi := range bis {
-		if _, err := bi.SeekToPayload(r); err != nil {
-			return nil, err
+	for i := range paths {
+		if len(paths[i]) == 0 {
+			return nil, errors.New("box path must not be empty")
 		}
+	}
 
-		var ctx Context
+	bs := make([]*BoxInfoWithPayload, 0, 8)
+	handler := func(handle *ReadHandle) (interface{}, error) {
+		path := handle.Path
 		if parent != nil {
-			ctx = parent.Context
+			path = path[1:]
 		}
-		if err := checkPayloadSize(r, bi); err != nil {
-			return nil, err
+		if handle.BoxInfo.Type == BoxTypeAny() {
+			return nil, nil
 		}
-		box, _, err := UnmarshalAny(r, bi.Type, bi.Size-bi.HeaderSize, ctx)
-		if err != nil {
-			return nil, err
+
+		fm, m := matchPath(paths, path)
+		if m {
+			box, _, err := handle.ReadPayload()
+			if err != nil {
+				return nil, err
+			}
+			bs = append(bs, &BoxInfoWithPayload{
+				Info:    handle.BoxInfo,
+				Payload: box,
+			})
 		}
-		bs = append(bs, &BoxInfoWithPayload{
-			Info:    *bi,
-			Payload: box,
-		})
+
+		if fm {
+			if _, err := handle.Expand(); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
 	}
-	return bs, nil
+
+	if parent != nil {
+		_, err := ReadBoxStructureFromInternal(r, parent, handler)
+		return bs, err
+	}
+	_, err := ReadBoxStructure(r, handler)
+	return bs, err
 }
 
 func ExtractBox(r io.ReadSeeker, parent *BoxInfo, path BoxPath) ([]*BoxInfo, error) {

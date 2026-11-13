@@ -3,6 +3,7 @@ package mp4
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -110,7 +111,7 @@ func WriteBoxInfo(w io.WriteSeeker, bi *BoxInfo) (*BoxInfo, error) {
 func ReadBoxInfo(r io.ReadSeeker) (*BoxInfo, error) {
 	offset, err := r.Seek(0, io.SeekCurrent)
 	if err != nil {
-		return nil, err
+		return nil, &ReaderError{Err: err}
 	}
 
 	bi := &BoxInfo{
@@ -120,7 +121,25 @@ func ReadBoxInfo(r io.ReadSeeker) (*BoxInfo, error) {
 	// read 8 bytes
 	buf := bytes.NewBuffer(make([]byte, 0, SmallHeaderSize))
 	if _, err := io.CopyN(buf, r, SmallHeaderSize); err != nil {
-		return nil, err
+		failureOffset, seekErr := currentOffset(r)
+		if seekErr != nil {
+			return nil, seekErr
+		}
+		if _, seekErr := r.Seek(offset, io.SeekStart); seekErr != nil {
+			return nil, &ReaderError{Offset: failureOffset, Err: seekErr}
+		}
+		if isTruncationError(err) {
+			originalErr := io.ErrUnexpectedEOF
+			if err == io.EOF && failureOffset == bi.Offset {
+				originalErr = io.EOF
+			}
+			return nil, &BoxError{
+				BoxInfo: *bi,
+				Offset:  failureOffset,
+				Err:     originalErr,
+			}
+		}
+		return nil, &ReaderError{Offset: failureOffset, Err: err}
 	}
 	bi.HeaderSize += SmallHeaderSize
 
@@ -133,38 +152,150 @@ func ReadBoxInfo(r io.ReadSeeker) (*BoxInfo, error) {
 		// box extends to end of file
 		offsetEOF, err := r.Seek(0, io.SeekEnd)
 		if err != nil {
-			return nil, err
+			return nil, &ReaderError{Err: err}
+		}
+		if uint64(offsetEOF) < bi.Offset {
+			return nil, &BoxError{
+				BoxInfo: *bi,
+				Offset:  bi.Offset,
+				Err:     errors.New("invalid size"),
+			}
 		}
 		bi.Size = uint64(offsetEOF) - bi.Offset
 		bi.ExtendToEOF = true
 		if _, err := bi.SeekToPayload(r); err != nil {
-			return nil, err
+			return nil, &ReaderError{Err: err}
 		}
 	} else if bi.Size == 1 {
 		// read more 8 bytes
 		buf.Reset()
-		if _, err := io.CopyN(buf, r, LargeHeaderSize-SmallHeaderSize); err != nil {
-			return nil, err
+		n, err := io.CopyN(buf, r, LargeHeaderSize-SmallHeaderSize)
+		if err != nil {
+			failureOffset, seekErr := currentOffset(r)
+			if seekErr != nil {
+				return nil, seekErr
+			}
+			if _, seekErr := r.Seek(offset, io.SeekStart); seekErr != nil {
+				return nil, &ReaderError{Offset: failureOffset, Err: seekErr}
+			}
+			if isTruncationError(err) {
+				originalErr := io.ErrUnexpectedEOF
+				if n == 0 && err == io.EOF {
+					originalErr = io.EOF
+				} else if n > 0 {
+					failureOffset = bi.Offset + bi.HeaderSize + uint64(n)
+				}
+				return nil, &BoxError{
+					BoxInfo: *bi,
+					Offset:  failureOffset,
+					Err:     originalErr,
+				}
+			}
+			return nil, &ReaderError{Offset: failureOffset, Err: err}
 		}
 		bi.HeaderSize += LargeHeaderSize - SmallHeaderSize
 		bi.Size = binary.BigEndian.Uint64(buf.Bytes())
 	}
 
 	if bi.Size == 0 {
-		return nil, fmt.Errorf("invalid size")
+		if _, seekErr := r.Seek(offset, io.SeekStart); seekErr != nil {
+			return nil, &ReaderError{Offset: bi.Offset, Err: seekErr}
+		}
+		return nil, &BoxError{
+			BoxInfo: *bi,
+			Offset:  bi.Offset,
+			Err:     errors.New("invalid size"),
+		}
+	}
+
+	if bi.Size < bi.HeaderSize {
+		if _, seekErr := r.Seek(offset, io.SeekStart); seekErr != nil {
+			return nil, &ReaderError{Offset: bi.Offset, Err: seekErr}
+		}
+		return nil, &BoxError{
+			BoxInfo: *bi,
+			Offset:  bi.Offset,
+			Err:     fmt.Errorf("invalid size: size=%d header_size=%d", bi.Size, bi.HeaderSize),
+		}
+	}
+	if bi.Offset > math.MaxInt64 || bi.Size > math.MaxInt64-bi.Offset {
+		if _, seekErr := r.Seek(offset, io.SeekStart); seekErr != nil {
+			return nil, &ReaderError{Offset: bi.Offset, Err: seekErr}
+		}
+		return nil, &BoxError{
+			BoxInfo: *bi,
+			Offset:  bi.Offset,
+			Err:     fmt.Errorf("box end offset overflows int64: offset=%d size=%d", bi.Offset, bi.Size),
+		}
 	}
 
 	return bi, nil
 }
 
 func (bi *BoxInfo) SeekToStart(s io.Seeker) (int64, error) {
-	return s.Seek(int64(bi.Offset), io.SeekStart)
+	if bi.Offset > math.MaxInt64 {
+		return 0, &BoxError{
+			BoxInfo: *bi,
+			Offset:  bi.Offset,
+			Err:     fmt.Errorf("box offset overflows int64: offset=%d", bi.Offset),
+		}
+	}
+	offset, err := s.Seek(int64(bi.Offset), io.SeekStart)
+	if err != nil {
+		return offset, &ReaderError{Offset: bi.Offset, Err: err}
+	}
+	return offset, nil
 }
 
 func (bi *BoxInfo) SeekToPayload(s io.Seeker) (int64, error) {
-	return s.Seek(int64(bi.Offset+bi.HeaderSize), io.SeekStart)
+	target, err := bi.payloadOffset()
+	if err != nil {
+		return 0, err
+	}
+	offset, err := s.Seek(int64(target), io.SeekStart)
+	if err != nil {
+		return offset, &ReaderError{Offset: target, Err: err}
+	}
+	return offset, nil
 }
 
 func (bi *BoxInfo) SeekToEnd(s io.Seeker) (int64, error) {
-	return s.Seek(int64(bi.Offset+bi.Size), io.SeekStart)
+	target, err := bi.endOffset()
+	if err != nil {
+		return 0, err
+	}
+	offset, err := s.Seek(target, io.SeekStart)
+	if err != nil {
+		return offset, &ReaderError{Offset: bi.Offset + bi.Size, Err: err}
+	}
+	if uint64(offset) != bi.Offset+bi.Size {
+		return offset, &BoxError{
+			BoxInfo: *bi,
+			Offset:  bi.Offset + bi.Size,
+			Err:     io.ErrUnexpectedEOF,
+		}
+	}
+	return offset, nil
+}
+
+func (bi *BoxInfo) payloadOffset() (uint64, error) {
+	if bi.HeaderSize > math.MaxInt64-bi.Offset {
+		return 0, &BoxError{
+			BoxInfo: *bi,
+			Offset:  bi.Offset,
+			Err:     fmt.Errorf("box payload offset overflows int64: offset=%d header_size=%d", bi.Offset, bi.HeaderSize),
+		}
+	}
+	return bi.Offset + bi.HeaderSize, nil
+}
+
+func (bi *BoxInfo) endOffset() (int64, error) {
+	if bi.Offset > math.MaxInt64 || bi.Size > math.MaxInt64-bi.Offset {
+		return 0, &BoxError{
+			BoxInfo: *bi,
+			Offset:  bi.Offset,
+			Err:     fmt.Errorf("box end offset overflows int64: offset=%d size=%d", bi.Offset, bi.Size),
+		}
+	}
+	return int64(bi.Offset + bi.Size), nil
 }
